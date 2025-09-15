@@ -16,6 +16,9 @@ load_dotenv()
 REC_BASE_DIR: str = os.getenv("REC_BASE_DIR") or (_ for _ in ()).throw(
     ValueError("环境变量 REC_BASE_DIR 未设置")
 )
+ARCHIVE_BASE_DIR: str = os.getenv("ARCHIVE_BASE_DIR") or (_ for _ in ()).throw(
+    ValueError("环境变量 ARCHIVE_BASE_DIR 未设置")
+)
 CLOUD_FS: str = os.getenv("CLOUD_FS") or (_ for _ in ()).throw(
     ValueError("环境变量 CLOUD_FS 未设置")
 )
@@ -25,10 +28,12 @@ CLOUD_BASE_DIR: str = os.getenv("CLOUD_BASE_DIR") or (_ for _ in ()).throw(
 RCLONE_BASE_URL: str = os.getenv("RCLONE_BASE_URL") or (_ for _ in ()).throw(
     ValueError("环境变量 RCLONE_BASE_URL 未设置")
 )
-DEST_SUBDIR: str = "smallfile"
+SMALL_FILE_SUBDIR: str = "smallfile"
+UPLOADED_SUBDIR: str = "uploaded"
 FLV_SIZE_LIMIT: int = 1 * 1024 * 1024  # 1MB
 XML_SIZE_LIMIT: int = 20 * 1024  # 20KB
 DAILY_UPLOAD_LIMIT: int = 50 * 1024 * 1024 * 1024  # 50GB
+ARCHIVE_THRESHOLD: int = 50 * 1024 * 1024 * 1024  # 50GB
 
 # 全局内存计数
 uploaded_today: int = 0
@@ -123,6 +128,17 @@ class FileInfo(BaseModel):
     IsDir: bool
 
 
+class DuInfo(BaseModel):
+    Available: int
+    Free: int
+    Total: int
+
+
+class DuResponse(BaseModel):
+    dir: str
+    info: DuInfo
+
+
 def bytes_to_mb_str(b: int) -> str:
     """将字节值格式化为 MB 字符串（保留两位小数）。"""
     return f"{b / (1024 * 1024):.2f} MB"
@@ -134,6 +150,35 @@ async def list_files(session: aiohttp.ClientSession, base_dir: str) -> List[File
     async with session.post(url, json=payload) as resp:
         data = await resp.json()
         return [FileInfo(**f) for f in data.get("list", [])]
+
+
+async def disk_usage(
+    session: aiohttp.ClientSession, dir: Optional[str] = None
+) -> DuResponse:
+    """调用 rclone RC 的 `core/du` 接口，返回目录的磁盘使用信息。
+
+    Args:
+        session: aiohttp 会话
+        dir: 要查询的本地目录路径（可选），如果为 None 则使用默认缓存目录
+
+    Returns:
+        DuResponse 包含 dir 与 info（Available/Free/Total 字节数）
+
+    Raises:
+        RuntimeError 当 RC 返回错误或响应格式不符合预期时
+    """
+    url = f"{RCLONE_BASE_URL}/core/du"
+    payload = {"dir": dir} if dir is not None else {}
+    async with session.post(url, json=payload) as resp:
+        try:
+            data = await resp.json()
+        except Exception as e:
+            raise RuntimeError(f"disk_usage: 响应解析失败: {e}")
+    try:
+        du = DuResponse.model_validate(data)
+    except Exception as e:
+        raise RuntimeError(f"disk_usage: 响应解析为 DuResponse 失败: {e}, data: {data}")
+    return du
 
 
 async def move_file(
@@ -153,6 +198,7 @@ async def move_file(
         except Exception as e:
             raise RuntimeError(f"move_file: 响应解析失败: {e}")
         if resp.status == 200 and not data:
+            logging.info(f"move_file: {src_path} -> {dst_path} 移动成功")
             return True
         if resp.status != 200 and "error" in data:
             raise RuntimeError(f"move_file error: {data.get('error')}")
@@ -233,7 +279,7 @@ async def move_small_files() -> None:
             if (xml_info.Size or 0) >= XML_SIZE_LIMIT:
                 continue
             # 目标子目录
-            dest_dir: str = f"{REC_BASE_DIR}/{DEST_SUBDIR}"
+            dest_dir: str = f"{REC_BASE_DIR}/{SMALL_FILE_SUBDIR}"
             # 检查目标目录是否存在，不存在则创建
             dest_dir_exists: bool = any(f.Path == dest_dir and f.IsDir for f in files)
             if not dest_dir_exists:
@@ -367,6 +413,97 @@ async def copy_file(
                 raise e
 
 
+async def move_dir(session: aiohttp.ClientSession, src_dir: str, dst_dir: str) -> None:
+    """异步移动目录（sync/move），返回 job 并轮询直到完成。
+
+    该接口会在后台为每个文件创建传输记录，`core/stats` 的 `transferring` 数组可能包含多个条目
+    属于同一个 job（group 字段为 `job/{jobid}`），此函数会聚合这些条目的 size 和 bytes 来更新进度条。
+    """
+    url = f"{RCLONE_BASE_URL}/sync/move"
+    payload = {
+        "srcFs": src_dir,
+        "dstFs": dst_dir,
+        "_config": {"CheckFirst": True, "Metadata": True, "PartialSuffix": ".partial"},
+        "_async": True,
+    }
+    logging.info(f"move_dir: 启动移动 src={src_dir} dst={dst_dir}")
+    async with session.post(url, json=payload) as resp:
+        data = await resp.json()
+        try:
+            # rclone 对于 async job 同样会返回 jobid
+            copy_resp = CopyFileResponse.model_validate(data)
+        except Exception as e:
+            raise RuntimeError(f"move_dir: sync/move 响应解析失败: {e}, data: {data}")
+        jobid = copy_resp.jobid
+
+    finished = False
+
+    with tqdm(
+        total=1,
+        desc=f"move_dir:{os.path.basename(src_dir)}",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as pbar:
+        while not finished:
+            # 检查 job 状态
+            status_url = f"{RCLONE_BASE_URL}/job/status"
+            status_payload = {"jobid": str(jobid)}
+            async with session.post(status_url, json=status_payload) as status_resp:
+                status_data = await status_resp.json()
+                try:
+                    job_status = JobStatusResponse.model_validate(status_data)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"move_dir: job/status 响应解析失败: {e}, data: {status_data}"
+                    )
+                finished = job_status.finished
+                success = job_status.success
+                error = job_status.error
+
+            # 聚合 core/stats 中属于该 job 的 transferring 信息
+            stats_url = f"{RCLONE_BASE_URL}/core/stats"
+            async with session.post(stats_url, json={}) as stats_resp:
+                stats_data = await stats_resp.json()
+                try:
+                    stats_obj = CoreStatsResponse.model_validate(stats_data)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"move_dir: core/stats 响应解析失败: {e}, data: {stats_data}"
+                    )
+                transferring = stats_obj.transferring or []
+
+                # 聚合属于 job/{jobid} 的条目
+                total_size = 0
+                total_bytes = 0
+                group_name = f"job/{jobid}"
+                for t in transferring:
+                    if t.group == group_name:
+                        total_size += t.size or 0
+                        total_bytes += t.bytes or 0
+
+                if total_size > 0:
+                    pbar.total = total_size
+                    pbar.n = min(total_bytes, total_size)
+                    pbar.refresh()
+
+            if finished:
+                pbar.close()
+                if not success:
+                    raise RuntimeError(f"move_dir: 任务失败, error: {error}")
+                logging.info(
+                    f"move_dir: 任务完成, jobid={jobid}, src={src_dir}, dst={dst_dir}"
+                )
+                break
+
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError as e:
+                logging.info("move_dir: 用户取消任务")
+                await stop_job(session, jobid)
+                raise e
+
+
 async def parse_month_from_filename(filename: str) -> int:
     """
     从文件名中解析出月份：先用 '-' 分割，取第三段（日期），再解析月份
@@ -412,7 +549,7 @@ async def upload_and_move() -> None:
             month = await parse_month_from_filename(file.Name)
             month_dir = f"{month}月"
             cloud_dir = f"{CLOUD_BASE_DIR}/{month_dir}"
-            uploaded_dir = f"{REC_BASE_DIR}/uploaded/{month_dir}"
+            uploaded_dir = f"{REC_BASE_DIR}/{UPLOADED_SUBDIR}/{month_dir}"
             await create_dir(session, CLOUD_FS, cloud_dir)
             await create_dir(session, "/", uploaded_dir)
             cloud_path = f"{cloud_dir}/{file.Name}"
@@ -429,18 +566,59 @@ async def upload_and_move() -> None:
             await move_file(session, file.Path, uploaded_path)
 
 
-async def batch_process_files() -> None:
+async def batch_upload_files() -> None:
     await move_small_files()
     await upload_and_move()
 
 
-async def main() -> None:
-    """主入口：使用 APScheduler 的 AsyncIOScheduler 在本地时间每天 10:00 调度 `batch_process_files`。"""
+async def archive_uploaded_files() -> None:
+    """当 `uploaded` 目录可用空间小于 50GB 时，将其内容归档到 ARCHIVE_BASE_DIR。
 
-    # 使用 AsyncIOScheduler 调度每天本地时间 10:00
+    行为：
+    1. 使用 `disk_usage` 查询 `REC_BASE_DIR/UPLOADED_SUBDIR` 的可用空间（使用 DuResponse.info.Available）。
+    2. 如果可用空间 < 50GB（50 * 1024**3），则调用 `move_dir` 将 `uploaded` 目录下的所有内容移动到 `ARCHIVE_BASE_DIR`。
+    """
+    uploaded_root = f"{REC_BASE_DIR}/{UPLOADED_SUBDIR}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            du = await disk_usage(session, uploaded_root)
+        except Exception as e:
+            logging.exception(f"archive_uploaded_files: 无法查询磁盘使用情况: {e}")
+            return
+
+        available = du.info.Available
+        logging.info(
+            f"archive_uploaded_files: {uploaded_root} 可用空间 {bytes_to_mb_str(available)}"
+        )
+
+        if available >= ARCHIVE_THRESHOLD:
+            logging.info(
+                f"archive_uploaded_files: 可用空间 >= 50GB ({bytes_to_mb_str(ARCHIVE_THRESHOLD)})，无需归档"
+            )
+            return
+
+        # 可用空间小于阈值，开始将 uploaded 目录移动到 ARCHIVE_BASE_DIR
+        logging.info(
+            f"archive_uploaded_files: 准备移动 {uploaded_root} -> {ARCHIVE_BASE_DIR}"
+        )
+        try:
+            await move_dir(session, uploaded_root, ARCHIVE_BASE_DIR)
+        except Exception as e:
+            logging.exception(f"archive_uploaded_files: 移动 {uploaded_root} 失败: {e}")
+
+
+async def main() -> None:
     scheduler = AsyncIOScheduler()
 
-    # 全局上传计数锁已在模块导入时初始化
+    # 处理退出信号
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # Windows 或不支持时退回到 signal.signal（只能在主线程）
+            signal.signal(sig, lambda *_: stop_event.set())
 
     async def reset_daily_counter() -> None:
         global uploaded_today
@@ -457,91 +635,45 @@ async def main() -> None:
         replace_existing=True,
     )
 
-    # 用于追踪当前正在运行的 asyncio Tasks（job_wrapper 的实例）
-    running_tasks: set[asyncio.Task] = set()
-
-    async def job_wrapper() -> None:
-        # 将当前协程包装为 Task 并注册，以便主线程可以取消它
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            running_tasks.add(current_task)
-        try:
-            logging.info("开始执行 batch_process_files")
-            await batch_process_files()
-            logging.info("batch_process_files 执行完成")
-        except asyncio.CancelledError:
-            logging.info(
-                "job_wrapper: 收到取消信号，正在取消正在运行的子任务（如果有）"
-            )
-            # 传播 CancelledError 以便上层也能处理
-            raise
-        except Exception as e:
-            logging.exception(f"batch_process_files 执行出错: {e}")
-        finally:
-            if current_task is not None and current_task in running_tasks:
-                running_tasks.discard(current_task)
-
-    # 首次运行：启动时立即执行一次 job_wrapper（不等待第一次 Cron 触发）
-    logging.info("首次启动：立即触发一次 batch_process_files")
-    await job_wrapper()
-
-    # 添加每天本地时间 10:00 的 Cron 触发器
-    trigger = CronTrigger(hour=10, minute=0)
+    # 添加每小时执行的批量上传任务
+    trigger = CronTrigger(minute=0)
     scheduler.add_job(
-        job_wrapper,
+        batch_upload_files,
         trigger,
-        id="daily_batch_10am",
+        id="batch_upload_files",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # 添加每小时检查并归档 uploaded 目录任务
+    archive_trigger = CronTrigger(minute=0)
+    scheduler.add_job(
+        archive_uploaded_files,
+        archive_trigger,
+        id="archive_uploaded_files",
         replace_existing=True,
         max_instances=1,
     )
 
     # 启动调度器
     scheduler.start()
-    logging.info(
-        "APScheduler 调度器已启动，任务已注册：每天本地时间 10:00 执行 batch_process_files"
-    )
+    logging.info("APScheduler 调度器已启动")
 
-    # 优雅退出处理
-    loop = asyncio.get_running_loop()
-
-    stop_event = asyncio.Event()
-
-    def _handle_signal(_: int, __: Optional[object] = None) -> None:
-        logging.info("收到终止信号，准备关闭调度器和事件循环")
-        stop_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle_signal, sig)
-        except NotImplementedError:
-            # Windows 上的某些事件循环实现不支持 add_signal_handler
-            signal.signal(sig, lambda s, f: _handle_signal(s, f))
-
-    # 等待停止事件
+    # 等待退出信号
     await stop_event.wait()
+    logging.info("收到退出信号，开始清理任务...")
 
-    logging.info("收到关闭信号：取消所有正在运行的调度任务...")
-    # 首先停止调度器，避免触发新的作业
+    # 停止调度器并等待正在运行的 job 完成或取消
     scheduler.shutdown(wait=False)
 
-    # 取消并等待所有正在运行的 job tasks，这会触发 job 内部的 CancelledError 分支
-    if running_tasks:
-        logging.info(f"正在取消 {len(running_tasks)} 个正在运行的任务")
-        for t in list(running_tasks):
-            try:
-                t.cancel()
-            except Exception:
-                logging.exception("取消任务时发生错误")
+    # 取消所有正在运行的异步任务
+    current_task = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if t is not current_task]
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 等待任务完成，设置一个超时以避免无限等待
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*running_tasks, return_exceptions=True), timeout=30
-            )
-        except asyncio.TimeoutError:
-            logging.warning("等待正在运行的任务完成超时，继续退出")
-
-    logging.info("所有运行中任务已处理，退出")
+    logging.info("清理完成，退出")
 
 
 if __name__ == "__main__":
