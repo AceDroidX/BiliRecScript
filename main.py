@@ -2,20 +2,40 @@ import aiohttp
 import asyncio
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from tqdm.asyncio import tqdm
 from dotenv import load_dotenv
 import os
+import logging
+import signal
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 load_dotenv()
 
-REC_BASE_DIR: str = os.getenv("REC_BASE_DIR") or (_ for _ in ()).throw(ValueError("环境变量 REC_BASE_DIR 未设置"))
-CLOUD_FS: str = os.getenv("CLOUD_FS") or (_ for _ in ()).throw(ValueError("环境变量 CLOUD_FS 未设置"))
-CLOUD_BASE_DIR: str = os.getenv("CLOUD_BASE_DIR") or (_ for _ in ()).throw(ValueError("环境变量 CLOUD_BASE_DIR 未设置"))
-RCLONE_BASE_URL: str = os.getenv("RCLONE_BASE_URL") or (_ for _ in ()).throw(ValueError("环境变量 RCLONE_BASE_URL 未设置"))
+REC_BASE_DIR: str = os.getenv("REC_BASE_DIR") or (_ for _ in ()).throw(
+    ValueError("环境变量 REC_BASE_DIR 未设置")
+)
+CLOUD_FS: str = os.getenv("CLOUD_FS") or (_ for _ in ()).throw(
+    ValueError("环境变量 CLOUD_FS 未设置")
+)
+CLOUD_BASE_DIR: str = os.getenv("CLOUD_BASE_DIR") or (_ for _ in ()).throw(
+    ValueError("环境变量 CLOUD_BASE_DIR 未设置")
+)
+RCLONE_BASE_URL: str = os.getenv("RCLONE_BASE_URL") or (_ for _ in ()).throw(
+    ValueError("环境变量 RCLONE_BASE_URL 未设置")
+)
 DEST_SUBDIR: str = "smallfile"
 FLV_SIZE_LIMIT: int = 1 * 1024 * 1024  # 1MB
 XML_SIZE_LIMIT: int = 20 * 1024  # 20KB
+DAILY_UPLOAD_LIMIT: int = 50 * 1024 * 1024 * 1024  # 50GB
+
+# 全局内存计数
+uploaded_today: int = 0
+
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 
 class RcloneError(BaseModel):
@@ -103,6 +123,11 @@ class FileInfo(BaseModel):
     IsDir: bool
 
 
+def bytes_to_mb_str(b: int) -> str:
+    """将字节值格式化为 MB 字符串（保留两位小数）。"""
+    return f"{b / (1024 * 1024):.2f} MB"
+
+
 async def list_files(session: aiohttp.ClientSession, base_dir: str) -> List[FileInfo]:
     url = f"{RCLONE_BASE_URL}/operations/list"
     payload = {"fs": "/", "remote": base_dir}
@@ -156,9 +181,9 @@ def get_file_info(files: List[FileInfo], name: str) -> Optional[FileInfo]:
     return None
 
 
-def should_skip_recent_file(mod_time_str: str, now: datetime, hours: int = 6) -> bool:
+def should_skip_recent_file(mod_time_str: str, now: datetime, hours: int) -> bool:
     """
-    判断文件ModTime距离现在是否小于6小时
+    判断文件ModTime距离现在是否小于n小时
     """
     try:
         # 去除纳秒部分，兼容官方datetime.fromisoformat
@@ -200,8 +225,8 @@ async def move_small_files() -> None:
             xml_info: Optional[FileInfo] = get_file_info(files, xml_filename)
             if not xml_info or xml_info.IsDir:
                 continue
-            # 跳过ModTime距离现在时间不到6小时的flv
-            if should_skip_recent_file(flv_info.ModTime, now, 6):
+            # 跳过ModTime距离现在时间不到2小时的flv
+            if should_skip_recent_file(flv_info.ModTime, now, 2):
                 continue
             if (flv_info.Size or 0) >= FLV_SIZE_LIMIT:
                 continue
@@ -223,6 +248,7 @@ async def move_small_files() -> None:
             )
             print(f"Moved: {filename} and {xml_filename}")
 
+
 async def stop_job(session: aiohttp.ClientSession, jobid: int) -> bool:
     """
     停止指定的任务
@@ -238,7 +264,10 @@ async def stop_job(session: aiohttp.ClientSession, jobid: int) -> bool:
             return True
         if resp.status != 200 and "error" in stop_resp:
             raise RuntimeError(f"stop_job error: {stop_resp.get('error')}")
-        raise RuntimeError(f"stop_job: 未知错误，状态码: {resp.status}, 响应: {stop_resp}")
+        raise RuntimeError(
+            f"stop_job: 未知错误，状态码: {resp.status}, 响应: {stop_resp}"
+        )
+
 
 async def copy_file(
     session: aiohttp.ClientSession,
@@ -261,7 +290,7 @@ async def copy_file(
         "_config": {"CheckFirst": True, "Metadata": True, "PartialSuffix": ".partial"},
         "_async": True,
     }
-    print(f"copy_file: 开始任务 src={src_path}, dst={dst_path}")
+    logging.info(f"copy_file: 开始任务 src={src_path}, dst={dst_path}")
     async with session.post(url, json=payload) as resp:
         data = await resp.json()
         try:
@@ -326,14 +355,14 @@ async def copy_file(
                 pbar.close()
                 if not success:
                     raise RuntimeError(f"copy_file: 任务失败, error: {error}")
-                print(
+                logging.info(
                     f"copy_file: 任务完成, jobid={jobid}, src={src_path}, dst={dst_path}"
                 )
                 break
             try:
                 await asyncio.sleep(check_interval)
             except asyncio.CancelledError as e:
-                print("copy_file: 用户取消任务")
+                logging.info("copy_file: 用户取消任务")
                 await stop_job(session, jobid)
                 raise e
 
@@ -356,25 +385,163 @@ async def upload_and_move() -> None:
     """
     上传文件到CLOUD_FS里f"{month}月"的文件夹，并移动本地文件到uploaded目录里f"{month}月"的文件夹
     允许上传的文件类型为flv、xml、txt
+    会在上传前检查当天已上传字节数，不超过 DAILY_UPLOAD_LIMIT（50GB）。
     """
+    global uploaded_today
     async with aiohttp.ClientSession() as session:
+        logging.info(
+            f"今日已上传: {bytes_to_mb_str(uploaded_today)} / 限额: {bytes_to_mb_str(DAILY_UPLOAD_LIMIT)}"
+        )
+
         files: List[FileInfo] = await list_files(session, REC_BASE_DIR)
         for file in files:
-            if file.Name.endswith((".flv", ".xml", ".txt")):
-                month = await parse_month_from_filename(file.Name)
-                month_dir = f"{month}月"
-                cloud_dir = f"{CLOUD_BASE_DIR}/{month_dir}"
-                uploaded_dir = f"{REC_BASE_DIR}/uploaded/{month_dir}"
-                await create_dir(session, CLOUD_FS, cloud_dir)
-                await create_dir(session, "/", uploaded_dir)
-                cloud_path = f"{cloud_dir}/{file.Name}"
-                uploaded_path = f"{uploaded_dir}/{file.Name}"
-                await copy_file(session, "/", file.Path, CLOUD_FS, cloud_path)
-                await move_file(session, file.Path, uploaded_path)
+            if not file.Name.endswith((".flv", ".xml", ".txt")):
+                continue
+            # 跳过ModTime距离现在时间不到2小时的文件
+            now = datetime.now(timezone.utc)
+            if should_skip_recent_file(file.ModTime, now, 2):
+                continue
 
-async def main() -> None:
+            # 如果已达到或超过当日限额，跳过剩余上传
+            if uploaded_today + file.Size >= DAILY_UPLOAD_LIMIT:
+                logging.info(
+                    f"将要达到今日上传限额，跳过剩余上传任务: 当前 {bytes_to_mb_str(uploaded_today)} + 文件 {bytes_to_mb_str(file.Size)} >= 限额 {bytes_to_mb_str(DAILY_UPLOAD_LIMIT)}"
+                )
+                break
+
+            month = await parse_month_from_filename(file.Name)
+            month_dir = f"{month}月"
+            cloud_dir = f"{CLOUD_BASE_DIR}/{month_dir}"
+            uploaded_dir = f"{REC_BASE_DIR}/uploaded/{month_dir}"
+            await create_dir(session, CLOUD_FS, cloud_dir)
+            await create_dir(session, "/", uploaded_dir)
+            cloud_path = f"{cloud_dir}/{file.Name}"
+            uploaded_path = f"{uploaded_dir}/{file.Name}"
+
+            # 执行上传并在成功后更新已上传字节计数
+            await copy_file(session, "/", file.Path, CLOUD_FS, cloud_path)
+            uploaded_today += file.Size
+            logging.info(
+                f"上传后今日已上传: {bytes_to_mb_str(uploaded_today)} (新增 {bytes_to_mb_str(file.Size)})"
+            )
+
+            # 移动本地文件到 uploaded 目录
+            await move_file(session, file.Path, uploaded_path)
+
+
+async def batch_process_files() -> None:
     await move_small_files()
     await upload_and_move()
+
+
+async def main() -> None:
+    """主入口：使用 APScheduler 的 AsyncIOScheduler 在本地时间每天 10:00 调度 `batch_process_files`。"""
+
+    # 使用 AsyncIOScheduler 调度每天本地时间 10:00
+    scheduler = AsyncIOScheduler()
+
+    # 全局上传计数锁已在模块导入时初始化
+
+    async def reset_daily_counter() -> None:
+        global uploaded_today
+        # 直接重置内存计数（无锁）
+        uploaded_today = 0
+        logging.info("已重置今日上传计数为 0")
+
+    # 添加每日零点重置任务
+    reset_trigger = CronTrigger(hour=0, minute=0)
+    scheduler.add_job(
+        reset_daily_counter,
+        reset_trigger,
+        id="reset_daily_counter",
+        replace_existing=True,
+    )
+
+    # 用于追踪当前正在运行的 asyncio Tasks（job_wrapper 的实例）
+    running_tasks: set[asyncio.Task] = set()
+
+    async def job_wrapper() -> None:
+        # 将当前协程包装为 Task 并注册，以便主线程可以取消它
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            running_tasks.add(current_task)
+        try:
+            logging.info("开始执行 batch_process_files")
+            await batch_process_files()
+            logging.info("batch_process_files 执行完成")
+        except asyncio.CancelledError:
+            logging.info(
+                "job_wrapper: 收到取消信号，正在取消正在运行的子任务（如果有）"
+            )
+            # 传播 CancelledError 以便上层也能处理
+            raise
+        except Exception as e:
+            logging.exception(f"batch_process_files 执行出错: {e}")
+        finally:
+            if current_task is not None and current_task in running_tasks:
+                running_tasks.discard(current_task)
+
+    # 首次运行：启动时立即执行一次 job_wrapper（不等待第一次 Cron 触发）
+    logging.info("首次启动：立即触发一次 batch_process_files")
+    await job_wrapper()
+
+    # 添加每天本地时间 10:00 的 Cron 触发器
+    trigger = CronTrigger(hour=10, minute=0)
+    scheduler.add_job(
+        job_wrapper,
+        trigger,
+        id="daily_batch_10am",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # 启动调度器
+    scheduler.start()
+    logging.info(
+        "APScheduler 调度器已启动，任务已注册：每天本地时间 10:00 执行 batch_process_files"
+    )
+
+    # 优雅退出处理
+    loop = asyncio.get_running_loop()
+
+    stop_event = asyncio.Event()
+
+    def _handle_signal(_: int, __: Optional[object] = None) -> None:
+        logging.info("收到终止信号，准备关闭调度器和事件循环")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+        except NotImplementedError:
+            # Windows 上的某些事件循环实现不支持 add_signal_handler
+            signal.signal(sig, lambda s, f: _handle_signal(s, f))
+
+    # 等待停止事件
+    await stop_event.wait()
+
+    logging.info("收到关闭信号：取消所有正在运行的调度任务...")
+    # 首先停止调度器，避免触发新的作业
+    scheduler.shutdown(wait=False)
+
+    # 取消并等待所有正在运行的 job tasks，这会触发 job 内部的 CancelledError 分支
+    if running_tasks:
+        logging.info(f"正在取消 {len(running_tasks)} 个正在运行的任务")
+        for t in list(running_tasks):
+            try:
+                t.cancel()
+            except Exception:
+                logging.exception("取消任务时发生错误")
+
+        # 等待任务完成，设置一个超时以避免无限等待
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*running_tasks, return_exceptions=True), timeout=30
+            )
+        except asyncio.TimeoutError:
+            logging.warning("等待正在运行的任务完成超时，继续退出")
+
+    logging.info("所有运行中任务已处理，退出")
 
 
 if __name__ == "__main__":
