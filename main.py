@@ -643,6 +643,7 @@ async def main() -> None:
         id="batch_upload_files",
         replace_existing=True,
         max_instances=1,
+        next_run_time=datetime.now(),  # 启动后立即运行一次
     )
 
     # 添加每小时检查并归档 uploaded 目录任务
@@ -653,6 +654,7 @@ async def main() -> None:
         id="archive_uploaded_files",
         replace_existing=True,
         max_instances=1,
+        next_run_time=datetime.now(),  # 启动后立即运行一次
     )
 
     # 启动调度器
