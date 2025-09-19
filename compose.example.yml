@@ -1,0 +1,22 @@
+services:
+  rclone:
+    image: rclone/rclone:latest
+    container_name: rclone
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - /home/acedroidx/rclone/cfg/rclone.conf:/app/rclone.conf:ro
+      - /home/acedroidx/share/rec/21452505-七海Nana7mi:/rec
+      - /home/acedroidx/disk/4T/录播:/archive
+    command: '-vv --config=/app/rclone.conf --rc-addr=:5572 --rc-user="test" --rc-pass="test" rcd'
+  bilirec_script:
+    image: acedroidx/bilirec_script:latest
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      REC_BASE_DIR: /rec
+      ARCHIVE_BASE_DIR: /archive
+      CLOUD_FS: "od:"
+      CLOUD_BASE_DIR: /Public/BilibiliRecorder/21452505-七海Nana7mi
+      RCLONE_BASE_URL: http://test:test@rclone:5572
