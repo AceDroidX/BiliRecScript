@@ -91,7 +91,7 @@ class CoreStatsResponse(BaseModel):
     errors: int
     eta: Optional[int]
     fatalError: bool
-    listed: int
+    listed: Optional[int]
     renames: int
     retryError: bool
     serverSideCopies: int
