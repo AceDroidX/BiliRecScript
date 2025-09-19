@@ -354,6 +354,7 @@ async def copy_file(
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
+        disable=None, # 设置为 None 以自动检测是否为 TTY
     ) as pbar:
         while not finished:
             # 查询任务状态
@@ -444,6 +445,7 @@ async def move_dir(session: aiohttp.ClientSession, src_dir: str, dst_dir: str) -
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
+        disable=None, # 设置为 None 以自动检测是否为 TTY
     ) as pbar:
         while not finished:
             # 检查 job 状态
