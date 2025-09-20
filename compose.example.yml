@@ -20,3 +20,5 @@ services:
       CLOUD_FS: "od:"
       CLOUD_BASE_DIR: /Public/BilibiliRecorder/21452505-七海Nana7mi
       RCLONE_BASE_URL: http://test:test@rclone:5572
+      DAILY_UPLOAD_LIMIT: 50
+      ARCHIVE_THRESHOLD: 50

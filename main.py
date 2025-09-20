@@ -28,12 +28,14 @@ CLOUD_BASE_DIR: str = os.getenv("CLOUD_BASE_DIR") or (_ for _ in ()).throw(
 RCLONE_BASE_URL: str = os.getenv("RCLONE_BASE_URL") or (_ for _ in ()).throw(
     ValueError("环境变量 RCLONE_BASE_URL 未设置")
 )
+DAILY_UPLOAD_LIMIT: int = int(os.getenv("DAILY_UPLOAD_LIMIT", "50"))  # 默认50GB
+ARCHIVE_THRESHOLD: int = int(os.getenv("ARCHIVE_THRESHOLD", "50"))  # 默认50GB
+DAILY_UPLOAD_LIMIT_BYTES: int = DAILY_UPLOAD_LIMIT * 1024 * 1024 * 1024
+ARCHIVE_THRESHOLD_BYTES: int = ARCHIVE_THRESHOLD * 1024 * 1024 * 1024
 SMALL_FILE_SUBDIR: str = "smallfile"
 UPLOADED_SUBDIR: str = "uploaded"
 FLV_SIZE_LIMIT: int = 1 * 1024 * 1024  # 1MB
 XML_SIZE_LIMIT: int = 20 * 1024  # 20KB
-DAILY_UPLOAD_LIMIT: int = 50 * 1024 * 1024 * 1024  # 50GB
-ARCHIVE_THRESHOLD: int = 50 * 1024 * 1024 * 1024  # 50GB
 
 # 全局内存计数
 uploaded_today: int = 0
@@ -139,9 +141,9 @@ class DuResponse(BaseModel):
     info: DuInfo
 
 
-def bytes_to_mb_str(b: int) -> str:
-    """将字节值格式化为 MB 字符串（保留两位小数）。"""
-    return f"{b / (1024 * 1024):.2f} MB"
+def bytes_to_gb_str(b: int) -> str:
+    """将字节值格式化为 GB 字符串（保留两位小数）。"""
+    return f"{b / (1024 * 1024 * 1024):.2f} GB"
 
 
 async def list_files(session: aiohttp.ClientSession, base_dir: str) -> List[FileInfo]:
@@ -354,7 +356,7 @@ async def copy_file(
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
-        disable=None, # 设置为 None 以自动检测是否为 TTY
+        disable=None,  # 设置为 None 以自动检测是否为 TTY
     ) as pbar:
         while not finished:
             # 查询任务状态
@@ -445,7 +447,7 @@ async def move_dir(session: aiohttp.ClientSession, src_dir: str, dst_dir: str) -
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
-        disable=None, # 设置为 None 以自动检测是否为 TTY
+        disable=None,  # 设置为 None 以自动检测是否为 TTY
     ) as pbar:
         while not finished:
             # 检查 job 状态
@@ -524,12 +526,12 @@ async def upload_and_move() -> None:
     """
     上传文件到CLOUD_FS里f"{month}月"的文件夹，并移动本地文件到uploaded目录里f"{month}月"的文件夹
     允许上传的文件类型为flv、xml、txt
-    会在上传前检查当天已上传字节数，不超过 DAILY_UPLOAD_LIMIT（50GB）。
+    会在上传前检查当天已上传字节数，不超过 DAILY_UPLOAD_LIMIT（默认50GB）。
     """
     global uploaded_today
     async with aiohttp.ClientSession() as session:
         logging.info(
-            f"今日已上传: {bytes_to_mb_str(uploaded_today)} / 限额: {bytes_to_mb_str(DAILY_UPLOAD_LIMIT)}"
+            f"今日已上传: {bytes_to_gb_str(uploaded_today)} / 限额: {bytes_to_gb_str(DAILY_UPLOAD_LIMIT_BYTES)}"
         )
 
         files: List[FileInfo] = await list_files(session, REC_BASE_DIR)
@@ -542,11 +544,11 @@ async def upload_and_move() -> None:
                 continue
 
             # 如果已达到或超过当日限额，跳过剩余上传
-            if uploaded_today + file.Size >= DAILY_UPLOAD_LIMIT:
+            if uploaded_today + file.Size >= DAILY_UPLOAD_LIMIT_BYTES:
                 logging.info(
-                    f"将要达到今日上传限额，跳过剩余上传任务: 当前 {bytes_to_mb_str(uploaded_today)} + 文件 {bytes_to_mb_str(file.Size)} >= 限额 {bytes_to_mb_str(DAILY_UPLOAD_LIMIT)}"
+                    f"将要达到今日上传限额，跳过剩余上传任务: 当前 {bytes_to_gb_str(uploaded_today)} + 文件 {bytes_to_gb_str(file.Size)} >= 限额 {bytes_to_gb_str(DAILY_UPLOAD_LIMIT_BYTES)}"
                 )
-                break
+                return
 
             month = await parse_month_from_filename(file.Name)
             month_dir = f"{month}月"
@@ -561,7 +563,7 @@ async def upload_and_move() -> None:
             await copy_file(session, "/", file.Path, CLOUD_FS, cloud_path)
             uploaded_today += file.Size
             logging.info(
-                f"上传后今日已上传: {bytes_to_mb_str(uploaded_today)} (新增 {bytes_to_mb_str(file.Size)})"
+                f"上传后今日已上传: {bytes_to_gb_str(uploaded_today)} (新增 {bytes_to_gb_str(file.Size)})"
             )
 
             # 移动本地文件到 uploaded 目录
@@ -574,11 +576,11 @@ async def batch_upload_files() -> None:
 
 
 async def archive_uploaded_files() -> None:
-    """当 `uploaded` 目录可用空间小于 50GB 时，将其内容归档到 ARCHIVE_BASE_DIR。
+    """当 `uploaded` 目录可用空间小于 ARCHIVE_THRESHOLD（默认50GB） 时，将其内容归档到 ARCHIVE_BASE_DIR。
 
     行为：
     1. 使用 `disk_usage` 查询 `REC_BASE_DIR/UPLOADED_SUBDIR` 的可用空间（使用 DuResponse.info.Available）。
-    2. 如果可用空间 < 50GB（50 * 1024**3），则调用 `move_dir` 将 `uploaded` 目录下的所有内容移动到 `ARCHIVE_BASE_DIR`。
+    2. 如果可用空间 < ARCHIVE_THRESHOLD（默认50GB），则调用 `move_dir` 将 `uploaded` 目录下的所有内容移动到 `ARCHIVE_BASE_DIR`。
     """
     uploaded_root = f"{REC_BASE_DIR}/{UPLOADED_SUBDIR}"
     async with aiohttp.ClientSession() as session:
@@ -590,12 +592,12 @@ async def archive_uploaded_files() -> None:
 
         available = du.info.Available
         logging.info(
-            f"archive_uploaded_files: {uploaded_root} 可用空间 {bytes_to_mb_str(available)}"
+            f"archive_uploaded_files: {uploaded_root} 可用空间 {bytes_to_gb_str(available)}"
         )
 
-        if available >= ARCHIVE_THRESHOLD:
+        if available >= ARCHIVE_THRESHOLD_BYTES:
             logging.info(
-                f"archive_uploaded_files: 可用空间 >= 50GB ({bytes_to_mb_str(ARCHIVE_THRESHOLD)})，无需归档"
+                f"archive_uploaded_files: 可用空间 >= 50GB ({bytes_to_gb_str(ARCHIVE_THRESHOLD_BYTES)})，无需归档"
             )
             return
 
