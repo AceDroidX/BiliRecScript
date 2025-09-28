@@ -229,7 +229,7 @@ def get_file_info(files: List[FileInfo], name: str) -> Optional[FileInfo]:
     return None
 
 
-def should_skip_recent_file(mod_time_str: str, now: datetime, hours: int) -> bool:
+def should_skip_recent_file(mod_time_str: str, now: datetime, hours: float) -> bool:
     """
     判断文件ModTime距离现在是否小于n小时
     """
@@ -273,8 +273,8 @@ async def move_small_files() -> None:
             xml_info: Optional[FileInfo] = get_file_info(files, xml_filename)
             if not xml_info or xml_info.IsDir:
                 continue
-            # 跳过ModTime距离现在时间不到2小时的flv
-            if should_skip_recent_file(flv_info.ModTime, now, 2):
+            # 跳过ModTime距离现在时间不到0.5小时的flv
+            if should_skip_recent_file(flv_info.ModTime, now, 0.5):
                 continue
             if (flv_info.Size or 0) >= FLV_SIZE_LIMIT:
                 continue
@@ -538,9 +538,9 @@ async def upload_and_move() -> None:
         for file in files:
             if not file.Name.endswith((".flv", ".xml", ".txt")):
                 continue
-            # 跳过ModTime距离现在时间不到2小时的文件
+            # 跳过ModTime距离现在时间不到0.5小时的文件
             now = datetime.now(timezone.utc)
-            if should_skip_recent_file(file.ModTime, now, 2):
+            if should_skip_recent_file(file.ModTime, now, 0.5):
                 continue
 
             # 如果已达到或超过当日限额，跳过剩余上传
