@@ -49,6 +49,13 @@ static ARCHIVE_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50)
 });
+/// 出错时是否退出程序（默认 true）
+static EXIT_ON_ERROR: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("EXIT_ON_ERROR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(true)
+});
 
 // ============================================================
 // 常量
@@ -78,6 +85,25 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .build()
         .expect("创建 HTTP 客户端失败")
 });
+
+/// Drop 守卫，确保 panic 时也释放原子锁
+struct RunningGuard(&'static AtomicBool);
+
+impl RunningGuard {
+    fn acquire(flag: &'static AtomicBool) -> Option<Self> {
+        if flag.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 // ============================================================
 // 数据模型（rclone RC API 响应）
@@ -487,6 +513,7 @@ async fn move_small_files() -> Result<()> {
         Ok(f) => f,
         Err(e) => {
             error!("move_small_files: 列出文件失败: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             return Ok(());
         }
     };
@@ -515,6 +542,7 @@ async fn move_small_files() -> Result<()> {
             Ok(false) => {}
             Err(e) => {
                 error!("move_small_files: 解析文件时间失败 ({}): {:?}", filename, e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
                 continue;
             }
         }
@@ -531,6 +559,7 @@ async fn move_small_files() -> Result<()> {
         if !dest_dir_exists {
             if let Err(e) = create_dir(client, "/", &dest_dir).await {
                 error!("move_small_files: 创建目录失败: {:?}", e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
                 continue;
             }
         }
@@ -540,12 +569,14 @@ async fn move_small_files() -> Result<()> {
         let flv_dst = format!("{}/{}", dest_dir, filename);
         if let Err(e) = move_file(client, &flv_src, &flv_dst).await {
             error!("move_small_files: 移动 FLV 失败 ({}): {:?}", filename, e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             continue;
         }
         let xml_src = format!("{}/{}", *REC_BASE_DIR, xml_filename);
         let xml_dst = format!("{}/{}", dest_dir, xml_filename);
         if let Err(e) = move_file(client, &xml_src, &xml_dst).await {
             error!("move_small_files: 移动 XML 失败 ({}): {:?}", xml_filename, e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             // FLV 已移动，记录错误但不回滚
         }
         info!("Moved: {} and {}", filename, xml_filename);
@@ -566,6 +597,7 @@ async fn upload_and_move() -> Result<()> {
         Ok(f) => f,
         Err(e) => {
             error!("upload_and_move: 列出文件失败: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             return Ok(());
         }
     };
@@ -581,6 +613,7 @@ async fn upload_and_move() -> Result<()> {
             Ok(false) => {}
             Err(e) => {
                 error!("upload_and_move: 解析文件时间失败 ({}): {:?}", file.name, e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
                 continue;
             }
         }
@@ -603,6 +636,7 @@ async fn upload_and_move() -> Result<()> {
             Ok(m) => m,
             Err(e) => {
                 error!("upload_and_move: 解析月份失败 ({}): {:?}", file.name, e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
                 continue;
             }
         };
@@ -612,10 +646,12 @@ async fn upload_and_move() -> Result<()> {
 
         if let Err(e) = create_dir(client, &CLOUD_FS, &cloud_dir).await {
             error!("upload_and_move: 创建云端目录失败: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             continue;
         }
         if let Err(e) = create_dir(client, "/", &uploaded_dir).await {
             error!("upload_and_move: 创建本地 uploaded 目录失败: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             continue;
         }
 
@@ -625,6 +661,7 @@ async fn upload_and_move() -> Result<()> {
         // 执行上传
         if let Err(e) = copy_file(client, "/", &file.path, &CLOUD_FS, &cloud_path, 1).await {
             error!("upload_and_move: 上传失败 ({}): {:?}", file.name, e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             continue;
         }
 
@@ -639,74 +676,69 @@ async fn upload_and_move() -> Result<()> {
         // 移动本地文件到 uploaded 目录
         if let Err(e) = move_file(client, &file.path, &uploaded_path).await {
             error!("upload_and_move: 移动本地文件失败 ({} -> {}): {:?}", file.path, uploaded_path, e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
         }
     }
     Ok(())
 }
 
 async fn batch_upload_files() -> Result<()> {
-    if UPLOAD_RUNNING.swap(true, Ordering::Acquire) {
+    let Some(_guard) = RunningGuard::acquire(&UPLOAD_RUNNING) else {
         info!("batch_upload_files: 上一轮尚未完成，跳过本次执行");
         return Ok(());
+    };
+    if let Err(e) = move_small_files().await {
+        error!("move_small_files 出错: {:?}", e);
+        if *EXIT_ON_ERROR { std::process::exit(1); }
     }
-    let result = async {
-        if let Err(e) = move_small_files().await {
-            error!("move_small_files 出错: {:?}", e);
-        }
-        if let Err(e) = upload_and_move().await {
-            error!("upload_and_move 出错: {:?}", e);
-        }
-        Ok::<_, anyhow::Error>(())
+    if let Err(e) = upload_and_move().await {
+        error!("upload_and_move 出错: {:?}", e);
+        if *EXIT_ON_ERROR { std::process::exit(1); }
     }
-    .await;
-    UPLOAD_RUNNING.store(false, Ordering::Release);
-    result
+    Ok(())
 }
 
 async fn archive_uploaded_files() -> Result<()> {
-    if ARCHIVE_RUNNING.swap(true, Ordering::Acquire) {
+    let Some(_guard) = RunningGuard::acquire(&ARCHIVE_RUNNING) else {
         info!("archive_uploaded_files: 上一轮尚未完成，跳过本次执行");
         return Ok(());
-    }
-    let result = async {
-        let uploaded_root = format!("{}/{}", *REC_BASE_DIR, UPLOADED_SUBDIR);
-        let client = &*CLIENT;
+    };
+    let uploaded_root = format!("{}/{}", *REC_BASE_DIR, UPLOADED_SUBDIR);
+    let client = &*CLIENT;
 
-        let du = match disk_usage(client, Some(&uploaded_root)).await {
-            Ok(du) => du,
-            Err(e) => {
-                error!("archive_uploaded_files: 无法查询磁盘使用情况: {:?}", e);
-                return Ok(());
-            }
-        };
-
-        let available = du.info.available.max(0) as u64;
-        info!(
-            "archive_uploaded_files: {} 可用空间 {}",
-            uploaded_root,
-            bytes_to_gb_str(available)
-        );
-
-        if available >= *ARCHIVE_THRESHOLD_BYTES {
-            info!(
-                "archive_uploaded_files: 可用空间 >= 50GB ({})，无需归档",
-                bytes_to_gb_str(*ARCHIVE_THRESHOLD_BYTES)
-            );
+    let du = match disk_usage(client, Some(&uploaded_root)).await {
+        Ok(du) => du,
+        Err(e) => {
+            error!("archive_uploaded_files: 无法查询磁盘使用情况: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
             return Ok(());
         }
+    };
 
+    let available = du.info.available.max(0) as u64;
+    info!(
+        "archive_uploaded_files: {} 可用空间 {}",
+        uploaded_root,
+        bytes_to_gb_str(available)
+    );
+
+    if available >= *ARCHIVE_THRESHOLD_BYTES {
         info!(
-            "archive_uploaded_files: 准备移动 {} -> {}",
-            uploaded_root, *ARCHIVE_BASE_DIR
+            "archive_uploaded_files: 可用空间 >= 50GB ({})，无需归档",
+            bytes_to_gb_str(*ARCHIVE_THRESHOLD_BYTES)
         );
-        if let Err(e) = move_dir(client, &uploaded_root, &ARCHIVE_BASE_DIR).await {
-            error!("archive_uploaded_files: 移动 {} 失败: {:?}", uploaded_root, e);
-        }
-        Ok::<_, anyhow::Error>(())
+        return Ok(());
     }
-    .await;
-    ARCHIVE_RUNNING.store(false, Ordering::Release);
-    result
+
+    info!(
+        "archive_uploaded_files: 准备移动 {} -> {}",
+        uploaded_root, *ARCHIVE_BASE_DIR
+    );
+    if let Err(e) = move_dir(client, &uploaded_root, &ARCHIVE_BASE_DIR).await {
+        error!("archive_uploaded_files: 移动 {} 失败: {:?}", uploaded_root, e);
+        if *EXIT_ON_ERROR { std::process::exit(1); }
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -732,6 +764,7 @@ async fn main() -> Result<()> {
     let _ = LazyLock::force(&RCLONE_BASE_URL);
     let _ = LazyLock::force(&DAILY_UPLOAD_LIMIT);
     let _ = LazyLock::force(&ARCHIVE_THRESHOLD);
+    let _ = LazyLock::force(&EXIT_ON_ERROR);
 
     let mut scheduler = JobScheduler::new().await?;
 
@@ -745,18 +778,28 @@ async fn main() -> Result<()> {
     scheduler.add(reset_job).await?;
 
     // 每小时批量上传任务 (每分钟的 0 秒执行)
-    let upload_job = Job::new_async("0 * * * *", |_uuid, _lock| {
-        Box::pin(async move {
-            batch_upload_files().await.ok();
-        })
+    let upload_job = Job::new_async("0 * * * *", {
+        move |_uuid, _lock| {
+            Box::pin(async move {
+                if let Err(e) = batch_upload_files().await {
+                    error!("定时上传任务出错: {:?}", e);
+                    if *EXIT_ON_ERROR { std::process::exit(1); }
+                }
+            })
+        }
     })?;
     scheduler.add(upload_job).await?;
 
     // 每小时归档检查任务
-    let archive_job = Job::new_async("0 * * * *", |_uuid, _lock| {
-        Box::pin(async move {
-            archive_uploaded_files().await.ok();
-        })
+    let archive_job = Job::new_async("0 * * * *", {
+        move |_uuid, _lock| {
+            Box::pin(async move {
+                if let Err(e) = archive_uploaded_files().await {
+                    error!("定时归档任务出错: {:?}", e);
+                    if *EXIT_ON_ERROR { std::process::exit(1); }
+                }
+            })
+        }
     })?;
     scheduler.add(archive_job).await?;
 
@@ -764,8 +807,14 @@ async fn main() -> Result<()> {
     info!("调度器已启动");
 
     // 启动后立即运行一次上传和归档任务（对应 Python 的 next_run_time=datetime.now()）
-    batch_upload_files().await.ok();
-    archive_uploaded_files().await.ok();
+    if let Err(e) = batch_upload_files().await {
+        error!("初始上传任务出错: {:?}", e);
+        if *EXIT_ON_ERROR { std::process::exit(1); }
+    }
+    if let Err(e) = archive_uploaded_files().await {
+        error!("初始归档任务出错: {:?}", e);
+        if *EXIT_ON_ERROR { std::process::exit(1); }
+    }
 
     // 等待退出信号 (SIGINT / SIGTERM)
     #[cfg(unix)]
