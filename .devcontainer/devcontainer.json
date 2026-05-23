@@ -1,29 +1,47 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/python
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
-	"name": "Python 3",
+	"name": "Rust",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "python:3.13-trixie",
-	"customizations": {
-		"vscode": {
-			"extensions": [
-				"vivaxy.vscode-conventional-commits",
-				"nemesv.copy-file-name",
-				"mhutchie.git-graph",
-				"ms-python.python",
-				"ms-python.black-formatter"
-			]
+	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+
+	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+	"mounts": [
+		{
+			"source": "devcontainer-cargo-cache-${devcontainerId}",
+			"target": "/usr/local/cargo",
+			"type": "volume"
+		},
+		{
+			"source": "opencode_share",
+			"target": "/home/vscode/.local/share/opencode",
+			"type": "volume"
+		},
+		{
+			"source": "opencode_config",
+			"target": "/home/vscode/.config/opencode",
+			"type": "volume"
+		},
+		{
+			"source": "opencode_cache",
+			"target": "/home/vscode/.cache/opencode",
+			"type": "volume"
+		},
+		{
+			"source": "opencode_state",
+			"target": "/home/vscode/.local/state/opencode",
+			"type": "volume"
 		}
-	}
+	],
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
-	// "features": {},
+	// "features": {}
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "pip3 install --user -r requirements.txt",
+	"postCreateCommand": "curl -fsSL https://opencode.ai/install | bash"
 
 	// Configure tool-specific properties.
 	// "customizations": {},

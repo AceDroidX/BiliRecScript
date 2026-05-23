@@ -1,2 +1,6 @@
+# Rust build artifacts
+/target/
+
+# Environment
 .env
 compose.yml

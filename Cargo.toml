@@ -1,0 +1,18 @@
+[package]
+name = "bilirec-script"
+version = "0.1.0"
+edition = "2021"
+description = "Bilibili recorder 文件上传与归档管理工具（Rust 复刻版）"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+indicatif = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio-cron-scheduler = "0.13"
+anyhow = "1"
