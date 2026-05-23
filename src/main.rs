@@ -769,7 +769,7 @@ async fn main() -> Result<()> {
     let mut scheduler = JobScheduler::new().await?;
 
     // 每日零点重置任务
-    let reset_job = Job::new_async("0 0 * * *", |_uuid, _lock| {
+    let reset_job = Job::new_async("0 0 0 * * *", |_uuid, _lock| {
         Box::pin(async move {
             UPLOADED_TODAY.store(0, Ordering::Relaxed);
             info!("已重置今日上传计数为 0");
@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
     scheduler.add(reset_job).await?;
 
     // 每小时批量上传任务 (每分钟的 0 秒执行)
-    let upload_job = Job::new_async("0 * * * *", {
+    let upload_job = Job::new_async("0 0 * * * *", {
         move |_uuid, _lock| {
             Box::pin(async move {
                 if let Err(e) = batch_upload_files().await {
@@ -791,7 +791,7 @@ async fn main() -> Result<()> {
     scheduler.add(upload_job).await?;
 
     // 每小时归档检查任务
-    let archive_job = Job::new_async("0 * * * *", {
+    let archive_job = Job::new_async("0 0 * * * *", {
         move |_uuid, _lock| {
             Box::pin(async move {
                 if let Err(e) = archive_uploaded_files().await {
