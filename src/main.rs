@@ -187,6 +187,7 @@ struct FileInfo {
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct DuInfo {
     available: i64,
     free: i64,
@@ -384,16 +385,14 @@ async fn copy_file(
 
         // 查询进度
         let stats_url = format!("{}/core/stats", *RCLONE_BASE_URL);
-        let stats_resp = client.post(&stats_url).json(&json!({})).send().await?;
+        let stats_payload = json!({"group": format!("job/{}", jobid)});
+        let stats_resp = client.post(&stats_url).json(&stats_payload).send().await?;
         let stats_data: serde_json::Value = stats_resp.json().await?;
         let stats: CoreStatsResponse = serde_json::from_value(stats_data.clone())
             .with_context(|| format!("copy_file: core/stats响应解析失败, data: {}", stats_data))?;
 
         let transferring = stats.transferring.unwrap_or_default();
-        let group_name = format!("job/{}", jobid);
-        let job_progress = transferring.iter().find(|t| t.group == group_name);
-
-        if let Some(progress) = job_progress {
+        if let Some(progress) = transferring.first() {
             let total = progress.size.max(1) as u64;
             let current = progress.bytes.max(0) as u64;
             pb.set_length(total);
@@ -465,21 +464,19 @@ async fn move_dir(client: &Client, src_dir: &str, dst_dir: &str) -> Result<()> {
 
         // 聚合 core/stats 中属于该 job 的 transferring 信息
         let stats_url = format!("{}/core/stats", *RCLONE_BASE_URL);
-        let stats_resp = client.post(&stats_url).json(&json!({})).send().await?;
+        let stats_payload = json!({"group": format!("job/{}", jobid)});
+        let stats_resp = client.post(&stats_url).json(&stats_payload).send().await?;
         let stats_data: serde_json::Value = stats_resp.json().await?;
         let stats: CoreStatsResponse = serde_json::from_value(stats_data.clone())
             .with_context(|| format!("move_dir: core/stats 响应解析失败, data: {}", stats_data))?;
 
         let transferring = stats.transferring.unwrap_or_default();
-        let group_name = format!("job/{}", jobid);
 
         let mut total_size: u64 = 0;
         let mut total_bytes: u64 = 0;
         for t in &transferring {
-            if t.group == group_name {
-                total_size = total_size.saturating_add(t.size.max(0) as u64);
-                total_bytes = total_bytes.saturating_add(t.bytes.max(0) as u64);
-            }
+            total_size = total_size.saturating_add(t.size.max(0) as u64);
+            total_bytes = total_bytes.saturating_add(t.bytes.max(0) as u64);
         }
 
         if total_size > 0 {
