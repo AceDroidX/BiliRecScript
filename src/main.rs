@@ -56,6 +56,13 @@ static EXIT_ON_ERROR: LazyLock<bool> = LazyLock::new(|| {
         .and_then(|v| v.parse().ok())
         .unwrap_or(true)
 });
+/// 云存储最小剩余空间（GB），低于此值时停止上传
+static MIN_REMOTE_FREE_SPACE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("MIN_REMOTE_FREE_SPACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+});
 
 // ============================================================
 // 常量
@@ -65,6 +72,9 @@ static DAILY_UPLOAD_LIMIT_BYTES: LazyLock<u64> = LazyLock::new(|| {
 });
 static ARCHIVE_THRESHOLD_BYTES: LazyLock<u64> = LazyLock::new(|| {
     *ARCHIVE_THRESHOLD * 1024 * 1024 * 1024
+});
+static MIN_REMOTE_FREE_SPACE_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    *MIN_REMOTE_FREE_SPACE * 1024 * 1024 * 1024
 });
 const SMALL_FILE_SUBDIR: &str = "smallfile";
 const UPLOADED_SUBDIR: &str = "uploaded";
@@ -201,6 +211,16 @@ struct DuResponse {
     info: DuInfo,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct AboutResponse {
+    total: Option<i64>,
+    used: Option<i64>,
+    free: Option<i64>,
+    trashed: Option<i64>,
+    other: Option<i64>,
+}
+
 // ============================================================
 // 工具函数
 // ============================================================
@@ -296,6 +316,16 @@ async fn disk_usage(client: &Client, dir: Option<&str>) -> Result<DuResponse> {
             )
         })?;
     Ok(du)
+}
+
+async fn check_remote_space(client: &Client, fs: &str) -> Result<AboutResponse> {
+    let url = format!("{}/operations/about", *RCLONE_BASE_URL);
+    let payload = json!({"fs": fs});
+    let resp = client.post(&url).json(&payload).send().await?;
+    let data: serde_json::Value = resp.json().await?;
+    let about: AboutResponse = serde_json::from_value(data.clone())
+        .with_context(|| format!("check_remote_space: 响应解析为 AboutResponse 失败, data: {}", data))?;
+    Ok(about)
 }
 
 async fn move_file(client: &Client, src_path: &str, dst_path: &str) -> Result<()> {
@@ -590,6 +620,28 @@ async fn upload_and_move() -> Result<()> {
     );
 
     let client = &*CLIENT;
+
+    // 检查云存储剩余空间
+    match check_remote_space(client, &CLOUD_FS).await {
+        Ok(about) => {
+            let free = about.free.unwrap_or(0).max(0) as u64;
+            if free < *MIN_REMOTE_FREE_SPACE_BYTES {
+                info!(
+                    "云存储剩余空间不足: {} < 最小要求 {}，跳过本轮上传",
+                    bytes_to_gb_str(free),
+                    bytes_to_gb_str(*MIN_REMOTE_FREE_SPACE_BYTES)
+                );
+                return Ok(());
+            }
+            info!("云存储剩余空间: {}", bytes_to_gb_str(free));
+        }
+        Err(e) => {
+            error!("check_remote_space 失败: {:?}", e);
+            if *EXIT_ON_ERROR { std::process::exit(1); }
+            return Ok(());
+        }
+    }
+
     let files = match list_files(client, &REC_BASE_DIR).await {
         Ok(f) => f,
         Err(e) => {
@@ -762,6 +814,7 @@ async fn main() -> Result<()> {
     let _ = LazyLock::force(&DAILY_UPLOAD_LIMIT);
     let _ = LazyLock::force(&ARCHIVE_THRESHOLD);
     let _ = LazyLock::force(&EXIT_ON_ERROR);
+    let _ = LazyLock::force(&MIN_REMOTE_FREE_SPACE);
 
     let mut scheduler = JobScheduler::new().await?;
 

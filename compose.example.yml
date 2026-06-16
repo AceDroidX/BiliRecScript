@@ -22,3 +22,4 @@ services:
       RCLONE_BASE_URL: http://test:test@rclone:5572
       DAILY_UPLOAD_LIMIT: 50
       ARCHIVE_THRESHOLD: 50
+      MIN_REMOTE_FREE_SPACE: 20
