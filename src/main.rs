@@ -25,11 +25,19 @@ static REC_BASE_DIR: LazyLock<String> = LazyLock::new(|| {
 static ARCHIVE_BASE_DIR: LazyLock<String> = LazyLock::new(|| {
     std::env::var("ARCHIVE_BASE_DIR").expect("环境变量 ARCHIVE_BASE_DIR 未设置")
 });
-static CLOUD_FS: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("CLOUD_FS").expect("环境变量 CLOUD_FS 未设置")
+static CLOUD_FS: LazyLock<Option<String>> = LazyLock::new(|| {
+    if *ENABLE_CLOUD_UPLOAD {
+        Some(std::env::var("CLOUD_FS").expect("环境变量 CLOUD_FS 未设置"))
+    } else {
+        std::env::var("CLOUD_FS").ok()
+    }
 });
-static CLOUD_BASE_DIR: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("CLOUD_BASE_DIR").expect("环境变量 CLOUD_BASE_DIR 未设置")
+static CLOUD_BASE_DIR: LazyLock<Option<String>> = LazyLock::new(|| {
+    if *ENABLE_CLOUD_UPLOAD {
+        Some(std::env::var("CLOUD_BASE_DIR").expect("环境变量 CLOUD_BASE_DIR 未设置"))
+    } else {
+        std::env::var("CLOUD_BASE_DIR").ok()
+    }
 });
 static RCLONE_BASE_URL: LazyLock<String> = LazyLock::new(|| {
     std::env::var("RCLONE_BASE_URL").expect("环境变量 RCLONE_BASE_URL 未设置")
@@ -62,6 +70,13 @@ static MIN_REMOTE_FREE_SPACE: LazyLock<u64> = LazyLock::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
+});
+/// 是否启用云上传（默认 true）
+static ENABLE_CLOUD_UPLOAD: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("ENABLE_CLOUD_UPLOAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(true)
 });
 
 // ============================================================
@@ -612,33 +627,39 @@ async fn move_small_files() -> Result<()> {
 }
 
 async fn upload_and_move() -> Result<()> {
-    let uploaded_today = UPLOADED_TODAY.load(Ordering::Relaxed);
-    info!(
-        "今日已上传: {} / 限额: {}",
-        bytes_to_gb_str(uploaded_today),
-        bytes_to_gb_str(*DAILY_UPLOAD_LIMIT_BYTES)
-    );
+    if *ENABLE_CLOUD_UPLOAD {
+        let uploaded_today = UPLOADED_TODAY.load(Ordering::Relaxed);
+        info!(
+            "今日已上传: {} / 限额: {}",
+            bytes_to_gb_str(uploaded_today),
+            bytes_to_gb_str(*DAILY_UPLOAD_LIMIT_BYTES)
+        );
+    } else {
+        info!("云上传已禁用（ENABLE_CLOUD_UPLOAD=false），跳过云端上传，仅移动本地文件");
+    }
 
     let client = &*CLIENT;
 
-    // 检查云存储剩余空间
-    match check_remote_space(client, &CLOUD_FS).await {
-        Ok(about) => {
-            let free = about.free.unwrap_or(0).max(0) as u64;
-            if free < *MIN_REMOTE_FREE_SPACE_BYTES {
-                info!(
-                    "云存储剩余空间不足: {} < 最小要求 {}，跳过本轮上传",
-                    bytes_to_gb_str(free),
-                    bytes_to_gb_str(*MIN_REMOTE_FREE_SPACE_BYTES)
-                );
+    // 检查云存储剩余空间（仅在启用云上传时）
+    if *ENABLE_CLOUD_UPLOAD {
+        match check_remote_space(client, CLOUD_FS.as_deref().unwrap()).await {
+            Ok(about) => {
+                let free = about.free.unwrap_or(0).max(0) as u64;
+                if free < *MIN_REMOTE_FREE_SPACE_BYTES {
+                    info!(
+                        "云存储剩余空间不足: {} < 最小要求 {}，跳过本轮上传",
+                        bytes_to_gb_str(free),
+                        bytes_to_gb_str(*MIN_REMOTE_FREE_SPACE_BYTES)
+                    );
+                    return Ok(());
+                }
+                info!("云存储剩余空间: {}", bytes_to_gb_str(free));
+            }
+            Err(e) => {
+                error!("check_remote_space 失败: {:?}", e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
                 return Ok(());
             }
-            info!("云存储剩余空间: {}", bytes_to_gb_str(free));
-        }
-        Err(e) => {
-            error!("check_remote_space 失败: {:?}", e);
-            if *EXIT_ON_ERROR { std::process::exit(1); }
-            return Ok(());
         }
     }
 
@@ -670,8 +691,8 @@ async fn upload_and_move() -> Result<()> {
         let file_size = file.size.max(0) as u64;
         let current_uploaded = UPLOADED_TODAY.load(Ordering::Relaxed);
 
-        // 如果已达到或超过当日限额，跳过剩余上传
-        if current_uploaded.saturating_add(file_size) >= *DAILY_UPLOAD_LIMIT_BYTES {
+        // 如果已达到或超过当日限额，跳过剩余上传（仅在启用云上传时检查）
+        if *ENABLE_CLOUD_UPLOAD && current_uploaded.saturating_add(file_size) >= *DAILY_UPLOAD_LIMIT_BYTES {
             info!(
                 "将要达到今日上传限额，跳过剩余上传任务: 当前 {} + 文件 {} >= 限额 {}",
                 bytes_to_gb_str(current_uploaded),
@@ -690,37 +711,43 @@ async fn upload_and_move() -> Result<()> {
             }
         };
         let month_dir = format!("{}月", month);
-        let cloud_dir = format!("{}/{}", *CLOUD_BASE_DIR, month_dir);
         let uploaded_dir = format!("{}/{}/{}", *REC_BASE_DIR, UPLOADED_SUBDIR, month_dir);
 
-        if let Err(e) = create_dir(client, &CLOUD_FS, &cloud_dir).await {
-            error!("upload_and_move: 创建云端目录失败: {:?}", e);
-            if *EXIT_ON_ERROR { std::process::exit(1); }
-            continue;
-        }
+        // 创建本地 uploaded 目录（始终执行）
         if let Err(e) = create_dir(client, "/", &uploaded_dir).await {
             error!("upload_and_move: 创建本地 uploaded 目录失败: {:?}", e);
             if *EXIT_ON_ERROR { std::process::exit(1); }
             continue;
         }
 
-        let cloud_path = format!("{}/{}", cloud_dir, file.name);
         let uploaded_path = format!("{}/{}", uploaded_dir, file.name);
 
-        // 执行上传
-        if let Err(e) = copy_file(client, "/", &file.path, &CLOUD_FS, &cloud_path, 1).await {
-            error!("upload_and_move: 上传失败 ({}): {:?}", file.name, e);
-            if *EXIT_ON_ERROR { std::process::exit(1); }
-            continue;
-        }
+        // 云上传相关操作（条件执行）
+        if *ENABLE_CLOUD_UPLOAD {
+            let cloud_dir = format!("{}/{}", CLOUD_BASE_DIR.as_deref().unwrap(), month_dir);
+            if let Err(e) = create_dir(client, CLOUD_FS.as_deref().unwrap(), &cloud_dir).await {
+                error!("upload_and_move: 创建云端目录失败: {:?}", e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
+                continue;
+            }
 
-        UPLOADED_TODAY.fetch_add(file_size, Ordering::Relaxed);
-        let new_uploaded = UPLOADED_TODAY.load(Ordering::Relaxed);
-        info!(
-            "上传后今日已上传: {} (新增 {})",
-            bytes_to_gb_str(new_uploaded),
-            bytes_to_gb_str(file_size)
-        );
+            let cloud_path = format!("{}/{}", cloud_dir, file.name);
+
+            // 执行上传
+            if let Err(e) = copy_file(client, "/", &file.path, CLOUD_FS.as_deref().unwrap(), &cloud_path, 1).await {
+                error!("upload_and_move: 上传失败 ({}): {:?}", file.name, e);
+                if *EXIT_ON_ERROR { std::process::exit(1); }
+                continue;
+            }
+
+            UPLOADED_TODAY.fetch_add(file_size, Ordering::Relaxed);
+            let new_uploaded = UPLOADED_TODAY.load(Ordering::Relaxed);
+            info!(
+                "上传后今日已上传: {} (新增 {})",
+                bytes_to_gb_str(new_uploaded),
+                bytes_to_gb_str(file_size)
+            );
+        }
 
         // 移动本地文件到 uploaded 目录
         if let Err(e) = move_file(client, &file.path, &uploaded_path).await {
@@ -808,8 +835,11 @@ async fn main() -> Result<()> {
     // 初始化常量（触发 LazyLock 求值，及早发现缺失变量）
     let _ = LazyLock::force(&REC_BASE_DIR);
     let _ = LazyLock::force(&ARCHIVE_BASE_DIR);
-    let _ = LazyLock::force(&CLOUD_FS);
-    let _ = LazyLock::force(&CLOUD_BASE_DIR);
+    let _ = LazyLock::force(&ENABLE_CLOUD_UPLOAD);
+    if *ENABLE_CLOUD_UPLOAD {
+        let _ = LazyLock::force(&CLOUD_FS);
+        let _ = LazyLock::force(&CLOUD_BASE_DIR);
+    }
     let _ = LazyLock::force(&RCLONE_BASE_URL);
     let _ = LazyLock::force(&DAILY_UPLOAD_LIMIT);
     let _ = LazyLock::force(&ARCHIVE_THRESHOLD);

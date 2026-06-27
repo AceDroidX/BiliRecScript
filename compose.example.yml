@@ -6,7 +6,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - /home/acedroidx/rclone/cfg/rclone.conf:/app/rclone.conf:ro
+      - /home/acedroidx/rclone/cfg/rclone.conf:/app/rclone.conf
       - /home/acedroidx/share/rec/21452505-七海Nana7mi:/rec
       - /home/acedroidx/disk/4T/录播:/archive
     command: '-vv --config=/app/rclone.conf --rc-addr=:5572 --rc-user="test" --rc-pass="test" rcd'
@@ -23,3 +23,4 @@ services:
       DAILY_UPLOAD_LIMIT: 50
       ARCHIVE_THRESHOLD: 50
       MIN_REMOTE_FREE_SPACE: 20
+      ENABLE_CLOUD_UPLOAD: true

@@ -23,6 +23,7 @@ Bilibili 录播文件上传与归档管理工具（Rust 复刻版）
 | `DAILY_UPLOAD_LIMIT` | 否 | 50 | 每日上传限额（GB） |
 | `ARCHIVE_THRESHOLD` | 否 | 50 | 归档阈值（GB） |
 | `MIN_REMOTE_FREE_SPACE` | 否 | 20 | 云存储最小剩余空间（GB），低于此值时停止上传 |
+| `ENABLE_CLOUD_UPLOAD` | 否 | true | 是否启用云上传 |
 
 ## 构建与运行
 
